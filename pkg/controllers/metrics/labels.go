@@ -37,35 +37,45 @@ func init() {
 }
 
 // SetUpLabelNames initializes both non-conditional and conditional metric labels and label names.
+func initializeLabelNames() {
+    NonConditionMetricLabelNames = []string{"name", "namespace"}
+    ConditionMetricLabelNames = []string{"name", "namespace", "condition", "status"}
+}
+
+// Figure out what the labels for the metrics are
+func addKubeStandardLabels() {
+    NonConditionMetricLabelNames = append(
+        NonConditionMetricLabelNames,
+        "app_kubernetes_io_name", "app_kubernetes_io_instance",
+        "app_kubernetes_io_version", "app_kubernetes_io_component",
+        "app_kubernetes_io_part_of", "app_kubernetes_io_managed_by",
+    )
+
+    ConditionMetricLabelNames = append(
+        ConditionMetricLabelNames,
+        "app_kubernetes_io_name", "app_kubernetes_io_instance",
+        "app_kubernetes_io_version", "app_kubernetes_io_component",
+        "app_kubernetes_io_part_of", "app_kubernetes_io_managed_by",
+    )
+}
+
+// Set default values for each label
+func initializeDefaultValues() {
+    for _, k := range NonConditionMetricLabelNames {
+        NonConditionMetricLabels[k] = ""
+    }
+
+    for _, k := range ConditionMetricLabelNames {
+        ConditionMetricLabels[k] = ""
+    }
+}
+
 func SetUpLabelNames(addKubeStandardLabels bool) {
-	NonConditionMetricLabelNames = []string{"name", "namespace"}
-	ConditionMetricLabelNames = []string{"name", "namespace", "condition", "status"}
-
-	// Figure out what the labels for the metrics are
-	if addKubeStandardLabels {
-		NonConditionMetricLabelNames = append(
-			NonConditionMetricLabelNames,
-			"app_kubernetes_io_name", "app_kubernetes_io_instance",
-			"app_kubernetes_io_version", "app_kubernetes_io_component",
-			"app_kubernetes_io_part_of", "app_kubernetes_io_managed_by",
-		)
-
-		ConditionMetricLabelNames = append(
-			ConditionMetricLabelNames,
-			"app_kubernetes_io_name", "app_kubernetes_io_instance",
-			"app_kubernetes_io_version", "app_kubernetes_io_component",
-			"app_kubernetes_io_part_of", "app_kubernetes_io_managed_by",
-		)
-	}
-
-	// Set default values for each label
-	for _, k := range NonConditionMetricLabelNames {
-		NonConditionMetricLabels[k] = ""
-	}
-
-	for _, k := range ConditionMetricLabelNames {
-		ConditionMetricLabels[k] = ""
-	}
+    initializeLabelNames()
+    if addKubeStandardLabels {
+        addKubeStandardLabels()
+    }
+    initializeDefaultValues()
 }
 
 // RefineLabels refines the given Prometheus Labels with values from a map `newLabels`
