@@ -44,7 +44,7 @@ type StoreReconciler struct {
 	ControllerClass string
 }
 
-func (r *StoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *StoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := r.Log.WithValues("secretstore", req.NamespacedName)
 
 	resourceLabels := ctrlmetrics.RefineNonConditionMetricLabels(map[string]string{"name": req.Name, "namespace": req.Namespace})
@@ -55,12 +55,13 @@ func (r *StoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	var ss esapi.SecretStore
 	err := r.Get(ctx, req.NamespacedName, &ss)
-	if apierrors.IsNotFound(err) {
-		ssmetrics.RemoveMetrics(req.Namespace, req.Name)
-		return ctrl.Result{}, nil
-	} else if err != nil {
-		log.Error(err, "unable to get SecretStore")
-		return ctrl.Result{}, err
+	if err != nil {
+    if apierrors.IsNotFound(err) {
+			ssmetrics.RemoveMetrics(req.Namespace, req.Name)
+			return ctrl.Result{}, nil
+    }
+    log.Error(err, "unable to get SecretStore")
+    return ctrl.Result{}, err
 	}
 
 	return reconcile(ctx, req, &ss, r.Client, log, r.ControllerClass, ssmetrics.GetGaugeVec, r.recorder, r.RequeueInterval)
