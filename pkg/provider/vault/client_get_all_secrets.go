@@ -51,36 +51,59 @@ func (c *client) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecret
 	return c.findSecretsFromTags(ctx, potentialSecrets, ref.Tags)
 }
 
-func (c *client) findSecretsFromTags(ctx context.Context, candidates []string, tags map[string]string) (map[string][]byte, error) {
-	secrets := make(map[string][]byte)
-	for _, name := range candidates {
-		match := true
-		metadata, err := c.readSecretMetadata(ctx, name)
-		if err != nil {
-			return nil, err
-		}
-		for tk, tv := range tags {
-			p, ok := metadata[tk]
-			if !ok || p != tv {
-				match = false
-				break
-			}
-		}
-		if match {
-			secret, err := c.GetSecret(ctx, esv1beta1.ExternalSecretDataRemoteRef{Key: name})
-			if errors.Is(err, esv1beta1.NoSecretError{}) {
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			if secret != nil {
-				secrets[name] = secret
-			}
-		}
-	}
-	return secrets, nil
+type SecretFinder interface {
+    FindSecretsFromTags(ctx context.Context, candidates []string, tags map[string]string) (map[string][]byte, error)
 }
+
+type secretFinder struct {
+    client SecretClient
+}
+
+type SecretClient interface {
+    ReadSecretMetadata(ctx context.Context, name string) (map[string]string, error)
+    GetSecret(ctx context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error)
+}
+
+func NewSecretFinder(client SecretClient) SecretFinder {
+    return &secretFinder{client: client}
+}
+
+func (sf *secretFinder) FindSecretsFromTags(ctx context.Context, candidates []string, tags map[string]string) (map[string][]byte, error) {
+    secrets := make(map[string][]byte)
+    for _, name := range candidates {
+        match, err := sf.isMatch(ctx, name, tags)
+        if err != nil {
+            return nil, err
+        }
+        if match {
+            secret, err := sf.client.GetSecret(ctx, esv1beta1.ExternalSecretDataRemoteRef{Key: name})
+            if errors.Is(err, esv1beta1.NoSecretError{}) {
+                continue
+            }
+            if err != nil {
+                return nil, err
+            }
+            if secret != nil {
+                secrets[name] = secret
+            }
+        }
+    }
+    return secrets, nil
+}
+
+func (sf *secretFinder) isMatch(ctx context.Context, name string, tags map[string]string) (bool, error) {
+    metadata, err := sf.client.ReadSecretMetadata(ctx, name)
+    if err != nil {
+        return false, err
+    }
+    for tk, tv := range tags {
+        if p, ok := metadata[tk]; !ok || p != tv {
+            return false, nil
+        }
+    }
+    return true, nil
+}
+
 
 func (c *client) findSecretsFromName(ctx context.Context, candidates []string, ref esv1beta1.FindName) (map[string][]byte, error) {
 	secrets := make(map[string][]byte)
