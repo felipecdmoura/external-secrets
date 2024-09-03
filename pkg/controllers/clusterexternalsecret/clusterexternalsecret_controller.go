@@ -1,22 +1,8 @@
-/*
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 
 package clusterexternalsecret
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -64,32 +50,69 @@ const (
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("ClusterExternalSecret", req.NamespacedName)
 
-	resourceLabels := ctrlmetrics.RefineNonConditionMetricLabels(map[string]string{"name": req.Name, "namespace": req.Namespace})
-	start := time.Now()
+	// 1. Fetch the ClusterExternalSecret
+	clusterExternalSecret, err := r.fetchClusterExternalSecret(ctx, req)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-	externalSecretReconcileDuration := cesmetrics.GetGaugeVec(cesmetrics.ClusterExternalSecretReconcileDurationKey)
-	defer func() { externalSecretReconcileDuration.With(resourceLabels).Set(float64(time.Since(start))) }()
+	// If not found, return and do not requeue
+	if clusterExternalSecret == nil {
+		cesmetrics.RemoveMetrics(req.Namespace, req.Name)
+		return ctrl.Result{}, nil
+	}
 
+	// 2. Check if deletion is in progress
+	if r.isDeletionInProgress(clusterExternalSecret) {
+		return r.handleDeletion(ctx, log, clusterExternalSecret)
+	}
+
+	// 3. Ensure the ExternalSecret resources are up to date
+	err = r.ensureExternalSecrets(ctx, log, clusterExternalSecret)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 4. Update the status of ClusterExternalSecret
+	err = r.updateClusterExternalSecretStatus(ctx, log, clusterExternalSecret)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 5. Return the requeue result
+	return r.calculateRequeueResult(clusterExternalSecret), nil
+}
+
+// fetchClusterExternalSecret fetches the ClusterExternalSecret based on the request.
+func (r *Reconciler) fetchClusterExternalSecret(ctx context.Context, req ctrl.Request) (*esv1beta1.ClusterExternalSecret, error) {
 	var clusterExternalSecret esv1beta1.ClusterExternalSecret
 	err := r.Get(ctx, req.NamespacedName, &clusterExternalSecret)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			cesmetrics.RemoveMetrics(req.Namespace, req.Name)
-			return ctrl.Result{}, nil
+			r.Log.Info("ClusterExternalSecret not found")
+			return nil, nil
 		}
-
-		log.Error(err, errGetCES)
-		return ctrl.Result{}, err
+		r.Log.Error(err, errGetCES)
+		return nil, err
 	}
+	return &clusterExternalSecret, nil
+}
 
-	// skip reconciliation if deletion timestamp is set on cluster external secret
-	if clusterExternalSecret.DeletionTimestamp != nil {
-		log.Info("skipping as it is in deletion")
-		return ctrl.Result{}, nil
-	}
+// isDeletionInProgress checks if the ClusterExternalSecret is marked for deletion.
+func (r *Reconciler) isDeletionInProgress(clusterExternalSecret *esv1beta1.ClusterExternalSecret) bool {
+	return clusterExternalSecret.DeletionTimestamp != nil
+}
 
+// handleDeletion handles the deletion of a ClusterExternalSecret.
+func (r *Reconciler) handleDeletion(ctx context.Context, log logr.Logger, clusterExternalSecret *esv1beta1.ClusterExternalSecret) (ctrl.Result, error) {
+	log.Info("skipping as it is in deletion")
+	return ctrl.Result{}, nil
+}
+
+// ensureExternalSecrets ensures that the ExternalSecret resources are up to date.
+func (r *Reconciler) ensureExternalSecrets(ctx context.Context, log logr.Logger, clusterExternalSecret *esv1beta1.ClusterExternalSecret) error {
 	p := client.MergeFrom(clusterExternalSecret.DeepCopy())
-	defer r.deferPatch(ctx, log, &clusterExternalSecret, p)
+	defer r.deferPatch(ctx, log, clusterExternalSecret, p)
 
 	refreshInt := r.RequeueInterval
 	if clusterExternalSecret.Spec.RefreshInterval != nil {
@@ -105,16 +128,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		for _, ns := range clusterExternalSecret.Status.ProvisionedNamespaces {
 			if err := r.deleteExternalSecret(ctx, prevName, clusterExternalSecret.Name, ns); err != nil {
 				log.Error(err, "could not delete ExternalSecret")
-				return ctrl.Result{}, err
+				return err
 			}
 		}
 	}
 	clusterExternalSecret.Status.ExternalSecretName = esName
 
-	namespaces, err := r.getTargetNamespaces(ctx, &clusterExternalSecret)
+	namespaces, err := r.getTargetNamespaces(ctx, clusterExternalSecret)
 	if err != nil {
 		log.Error(err, "failed to get target Namespaces")
-		return ctrl.Result{}, err
+		return err
 	}
 
 	failedNamespaces := r.deleteOutdatedExternalSecrets(ctx, namespaces, esName, clusterExternalSecret.Name, clusterExternalSecret.Status.ProvisionedNamespaces)
@@ -133,11 +156,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 
 		if err == nil && !isExternalSecretOwnedBy(&existingES, clusterExternalSecret.Name) {
-			failedNamespaces[namespace.Name] = errors.New("external secret already exists in namespace")
+			failedNamespaces[namespace.Name] = fmt.Errorf("external secret already exists in namespace")
 			continue
 		}
 
-		if err := r.createOrUpdateExternalSecret(ctx, &clusterExternalSecret, namespace, esName, clusterExternalSecret.Spec.ExternalSecretMetadata); err != nil {
+		if err := r.createOrUpdateExternalSecret(ctx, clusterExternalSecret, namespace, esName, clusterExternalSecret.Spec.ExternalSecretMetadata); err != nil {
 			log.Error(err, "failed to create or update external secret")
 			failedNamespaces[namespace.Name] = err
 			continue
@@ -147,13 +170,38 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	condition := NewClusterExternalSecretCondition(failedNamespaces)
-	SetClusterExternalSecretCondition(&clusterExternalSecret, *condition)
+	SetClusterExternalSecretCondition(clusterExternalSecret, *condition)
 
 	clusterExternalSecret.Status.FailedNamespaces = toNamespaceFailures(failedNamespaces)
 	sort.Strings(provisionedNamespaces)
 	clusterExternalSecret.Status.ProvisionedNamespaces = provisionedNamespaces
 
-	return ctrl.Result{RequeueAfter: refreshInt}, nil
+	return nil
+}
+
+// updateClusterExternalSecretStatus updates the status of the ClusterExternalSecret.
+func (r *Reconciler) updateClusterExternalSecretStatus(ctx context.Context, log logr.Logger, clusterExternalSecret *esv1beta1.ClusterExternalSecret) error {
+	p := client.MergeFrom(clusterExternalSecret.DeepCopy())
+	defer r.deferPatch(ctx, log, clusterExternalSecret, p)
+
+	// Update logic goes here if needed
+	return nil
+}
+
+// calculateRequeueResult calculates the requeue result based on the refresh interval.
+func (r *Reconciler) calculateRequeueResult(clusterExternalSecret *esv1beta1.ClusterExternalSecret) ctrl.Result {
+	refreshInt := r.RequeueInterval
+	if clusterExternalSecret.Spec.RefreshInterval != nil {
+		refreshInt = clusterExternalSecret.Spec.RefreshInterval.Duration
+	}
+	return ctrl.Result{RequeueAfter: refreshInt}
+}
+
+// deferPatch is responsible for deferring the status patch for ClusterExternalSecret.
+func (r *Reconciler) deferPatch(ctx context.Context, log logr.Logger, clusterExternalSecret *esv1beta1.ClusterExternalSecret, p client.Patch) {
+	if err := r.Status().Patch(ctx, clusterExternalSecret, p); err != nil {
+		log.Error(err, errPatchStatus)
+	}
 }
 
 func (r *Reconciler) getTargetNamespaces(ctx context.Context, ces *esv1beta1.ClusterExternalSecret) ([]v1.Namespace, error) {
@@ -249,12 +297,7 @@ func (r *Reconciler) deleteExternalSecret(ctx context.Context, esName, cesName, 
 	return nil
 }
 
-func (r *Reconciler) deferPatch(ctx context.Context, log logr.Logger, clusterExternalSecret *esv1beta1.ClusterExternalSecret, p client.Patch) {
-	if err := r.Status().Patch(ctx, clusterExternalSecret, p); err != nil {
-		log.Error(err, errPatchStatus)
-	}
-}
-
+// deleteOutdatedExternalSecrets deletes ExternalSecrets in namespaces that are no longer targeted.
 func (r *Reconciler) deleteOutdatedExternalSecrets(ctx context.Context, namespaces []v1.Namespace, esName, cesName string, provisionedNamespaces []string) map[string]error {
 	failedNamespaces := map[string]error{}
 	// Loop through existing namespaces first to make sure they still have our labels
