@@ -90,13 +90,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log := r.Log.WithValues("Webhookconfig", req.NamespacedName)
 	var cfg admissionregistration.ValidatingWebhookConfiguration
 	err := r.Get(ctx, req.NamespacedName, &cfg)
-	if apierrors.IsNotFound(err) {
-		return ctrl.Result{}, nil
-	} else if err != nil {
+	if err != nil{
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		log.Error(err, "unable to get Webhookconfig")
 		return ctrl.Result{}, err
 	}
-
+	
 	if cfg.Labels[constants.WellKnownLabelKey] != constants.WellKnownLabelValueWebhook {
 		log.Info("ignoring webhook due to missing labels", constants.WellKnownLabelKey, constants.WellKnownLabelValueWebhook)
 		return ctrl.Result{}, nil
