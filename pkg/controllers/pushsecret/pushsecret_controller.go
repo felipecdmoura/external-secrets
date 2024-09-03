@@ -71,137 +71,184 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("pushsecret", req.NamespacedName)
+func totalReconcileDuration(reconcileLabels map[string]string, start time.Time) {
+	duration := float64(time.Since(start).Seconds())
+    psmetrics.GetGaugeVec(psmetrics.PushSecretReconcileDurationKey).
+        With(labels).
+        Set(duration)
+}
 
-	resourceLabels := ctrlmetrics.RefineNonConditionMetricLabels(map[string]string{"name": req.Name, "namespace": req.Namespace})
-	start := time.Now()
-
-	pushSecretReconcileDuration := psmetrics.GetGaugeVec(psmetrics.PushSecretReconcileDurationKey)
-	defer func() { pushSecretReconcileDuration.With(resourceLabels).Set(float64(time.Since(start))) }()
-
+func (r *Reconciler) fetchPushSecret(ctx context.Context, req ctrl.Request) (esapi.PushSecret, error) {
 	var ps esapi.PushSecret
-	mgr := secretstore.NewManager(r.Client, r.ControllerClass, false)
-	defer mgr.Close(ctx)
+	err := r.Get(ctx, req.NamespacedName, &ps)
+	return ps, err
+}
 
-	if err := r.Get(ctx, req.NamespacedName, &ps); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-
-		msg := "unable to get PushSecret"
-		r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
-		log.Error(err, msg)
-
-		return ctrl.Result{}, fmt.Errorf("get resource: %w", err)
+func (r *Reconciler) handleFetchError(err error, log logr.Logger, ps *esapi.PushSecret) (ctrl.Result, error) {
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{}, nil
 	}
+	msg := "unable to get PushSecret"
+	r.recorder.Event(ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
+	log.Error(err, msg)
+	return ctrl.Result{}, fmt.Errorf("get resource: %w", err)
+}
 
-	refreshInt := r.RequeueInterval
+func (r *Reconciler) initializeManager(ctx context.Context) secretstore.Manager {
+	return secretstore.NewManager(r.Client, r.ControllerClass, false)
+}
+
+func (r *Reconciler) getRefreshInterval(ps esapi.PushSecret) time.Duration {
 	if ps.Spec.RefreshInterval != nil {
-		refreshInt = ps.Spec.RefreshInterval.Duration
+		return ps.Spec.RefreshInterval.Duration
 	}
+	return r.RequeueInterval
+}
 
-	p := client.MergeFrom(ps.DeepCopy())
-	defer func() {
-		if err := r.Client.Status().Patch(ctx, &ps, p); err != nil {
-			log.Error(err, errPatchStatus)
-		}
-	}()
+func (r *Reconciler) manageFinalizers(ctx context.Context, ps *esapi.PushSecret, mgr secretstore.Manager, log logr.Logger) error {
 	switch ps.Spec.DeletionPolicy {
 	case esapi.PushSecretDeletionPolicyDelete:
-		// finalizer logic. Only added if we should delete the secrets
-		if ps.ObjectMeta.DeletionTimestamp.IsZero() {
-			if !controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
-				controllerutil.AddFinalizer(&ps, pushSecretFinalizer)
-				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
-				}
-
-				return ctrl.Result{}, nil
-			}
-		} else {
-			if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
-				// trigger a cleanup with no Synced Map
-				badState, err := r.DeleteSecretFromProviders(ctx, &ps, esapi.SyncedPushSecretsMap{}, mgr)
-				if err != nil {
-					msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-					r.markAsFailed(msg, &ps, badState)
-
-					return ctrl.Result{}, err
-				}
-
-				controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
-				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
-				}
-
-				return ctrl.Result{}, nil
-			}
-		}
+		return r.handleFinalizerDeletion(ctx, ps, mgr, log)
 	case esapi.PushSecretDeletionPolicyNone:
-		if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
-			controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
-			if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
-				return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
-			}
-		}
+		return r.removeFinalizerIfPresent(ctx, ps, log)
 	default:
+		return nil
 	}
+}
 
-	secret, err := r.GetSecret(ctx, ps)
-	if err != nil {
-		r.markAsFailed(errFailedGetSecret, &ps, nil)
-
-		return ctrl.Result{}, err
+func (r *Reconciler) handleFinalizerDeletion(ctx context.Context, ps *esapi.PushSecret, mgr secretstore.Manager, log logr.Logger) error {
+	if ps.ObjectMeta.DeletionTimestamp.IsZero() {
+		return r.addFinalizerIfAbsent(ctx, ps, log)
 	}
+	return r.cleanupAndRemoveFinalizer(ctx, ps, mgr, log)
+}
+
+func (r *Reconciler) addFinalizerIfAbsent(ctx context.Context, ps *esapi.PushSecret, log logr.Logger) error {
+	if !controllerutil.ContainsFinalizer(ps, pushSecretFinalizer) {
+		controllerutil.AddFinalizer(ps, pushSecretFinalizer)
+		if err := r.Client.Update(ctx, ps, &client.UpdateOptions{}); err != nil {
+			return fmt.Errorf("could not update finalizers: %w", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+func (r *Reconciler) handleSecretStoreError(err error, ps *esapi.PushSecret) (ctrl.Result, error) {
+	r.markAsFailed(err.Error(), ps, nil)
+	return ctrl.Result{}, err
+}
+
+func (r *Reconciler) handleSecretError(err error, ps *esapi.PushSecret) (ctrl.Result, error) {
+	r.markAsFailed(errFailedGetSecret, ps, nil)
+	return ctrl.Result{}, err
+}
+
+func (r *Reconciler) removeFinalizerIfPresent(ctx context.Context, ps *esapi.PushSecret, log logr.Logger) error {
+	if controllerutil.ContainsFinalizer(ps, pushSecretFinalizer) {
+		controllerutil.RemoveFinalizer(ps, pushSecretFinalizer)
+		if err := r.Client.Update(ctx, ps, &client.UpdateOptions{}); err != nil {
+			return fmt.Errorf("could not update finalizers: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) cleanupAndRemoveFinalizer(ctx context.Context, ps *esapi.PushSecret, mgr secretstore.Manager, log logr.Logger) error {
+	if controllerutil.ContainsFinalizer(ps, pushSecretFinalizer) {
+		badState, err := r.DeleteSecretFromProviders(ctx, ps, esapi.SyncedPushSecretsMap{}, mgr)
+		if err != nil {
+			r.markAsFailed(fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err), ps, badState)
+			return err
+		}
+		controllerutil.RemoveFinalizer(ps, pushSecretFinalizer)
+		if err := r.Client.Update(ctx, ps, &client.UpdateOptions{}); err != nil {
+			return fmt.Errorf("could not update finalizers: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) getManagedSecretStores(ctx context.Context, ps esapi.PushSecret, namespace string) ([]esapi.SecretStore, error) {
 	secretStores, err := r.GetSecretStores(ctx, ps)
 	if err != nil {
-		r.markAsFailed(err.Error(), &ps, nil)
+		return nil, err
+	}
+	return removeUnmanagedStores(ctx, namespace, r, secretStores)
+}
 
+func (r *Reconciler) pushSecretsToProviders(ctx context.Context, secretStores []esapi.SecretStore, ps esapi.PushSecret, secret corev1.Secret, mgr secretstore.Manager, log logr.Logger) (esapi.SyncedPushSecretsMap, error) {
+	syncedSecrets, err := r.PushSecretToProviders(ctx, secretStores, ps, secret, mgr)
+	if err != nil && errors.Is(err, locks.ErrConflict) {
+		log.Info("retry to acquire lock to update the secret later", "error", err)
+		return nil, ctrl.Result{Requeue: true}
+	}
+	return syncedSecrets, err
+}
+
+func (r *Reconciler) handlePushError(err error, ps *esapi.PushSecret, syncedSecrets esapi.SyncedPushSecretsMap, log logr.Logger) (ctrl.Result, error) {
+	totalSecrets := mergeSecretState(syncedSecrets, ps.Status.SyncedPushSecrets)
+	msg := fmt.Sprintf(errFailedSetSecret, err)
+	r.markAsFailed(msg, ps, totalSecrets)
+	return ctrl.Result{}, err
+}
+
+func (r *Reconciler) handleDeletionPolicy(ctx context.Context, ps esapi.PushSecret, syncedSecrets esapi.SyncedPushSecretsMap, mgr secretstore.Manager) error {
+	if ps.Spec.DeletionPolicy == esapi.PushSecretDeletionPolicyDelete {
+		badSyncState, err := r.DeleteSecretFromProviders(ctx, &ps, syncedSecrets, mgr)
+		if err != nil {
+			msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
+			r.markAsFailed(msg, &ps, badSyncState)
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := r.Log.WithValues("pushsecret", req.NamespacedName)
+	resourceLabels := ctrlmetrics.RefineNonConditionMetricLabels(map[string]string{"name": req.Name, "namespace": req.Namespace})
+	start := time.Now()
+	defer totalReconcileDuration(resourceLabels, start)
+
+
+	ps, err := r.fetchPushSecret(ctx, req)
+	if err != nil {
+		return r.handleFetchError(err, log, &ps)
+	}
+
+	mgr := r.initializeManager(ctx)
+	defer mgr.Close(ctx)
+
+	refreshInt := r.getRefreshInterval(ps)
+	if err := r.manageFinalizers(ctx, &ps, mgr, log); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	secret, err := r.getSecret(ctx, ps)
+	if err != nil {
+		return r.handleSecretError(err, &ps)
+	}
+
+	secretStores, err := r.getManagedSecretStores(ctx, ps, req.Namespace)
+	if err != nil {
+		return r.handleSecretStoreError(err, &ps)
 	}
 
 	if err := r.applyTemplate(ctx, &ps, secret); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	secretStores, err = removeUnmanagedStores(ctx, req.Namespace, r, secretStores)
+	syncedSecrets, err := r.pushSecretsToProviders(ctx, secretStores, ps, secret, mgr, log)
 	if err != nil {
-		r.markAsFailed(err.Error(), &ps, nil)
+		return r.handlePushError(err, &ps, syncedSecrets, log)
+	}
+
+	if err := r.handleDeletionPolicy(ctx, ps, syncedSecrets, mgr); err != nil {
 		return ctrl.Result{}, err
-	}
-	// if no stores are managed by this controller
-	if len(secretStores) == 0 {
-		return ctrl.Result{}, nil
-	}
-
-	syncedSecrets, err := r.PushSecretToProviders(ctx, secretStores, ps, secret, mgr)
-	if err != nil {
-		if errors.Is(err, locks.ErrConflict) {
-			log.Info("retry to acquire lock to update the secret later", "error", err)
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		totalSecrets := mergeSecretState(syncedSecrets, ps.Status.SyncedPushSecrets)
-		msg := fmt.Sprintf(errFailedSetSecret, err)
-		r.markAsFailed(msg, &ps, totalSecrets)
-
-		return ctrl.Result{}, err
-	}
-	switch ps.Spec.DeletionPolicy {
-	case esapi.PushSecretDeletionPolicyDelete:
-		badSyncState, err := r.DeleteSecretFromProviders(ctx, &ps, syncedSecrets, mgr)
-		if err != nil {
-			msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-			r.markAsFailed(msg, &ps, badSyncState)
-			return ctrl.Result{}, err
-		}
-	case esapi.PushSecretDeletionPolicyNone:
-	default:
 	}
 
 	r.markAsDone(&ps, syncedSecrets)
-
 	return ctrl.Result{RequeueAfter: refreshInt}, nil
 }
 
